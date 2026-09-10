@@ -36,8 +36,8 @@ The model jointly predicts five targets:
 |---|---|
 | Block X | X coordinate of the block |
 | Block Y | Y coordinate of the block |
-| Offset X | X offset |
-| Offset Y | Y offset |
+| Offset X | X coordinate of the offset |
+| Offset Y | Y coordinate of the offset |
 | Clock | Clock phase |
 
 ---
