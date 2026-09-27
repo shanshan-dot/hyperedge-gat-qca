@@ -5,7 +5,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from pathlib import Path
 import re
-from collections import defaultdict
 from edge_gat import GATEncoder
 
 
@@ -26,7 +25,7 @@ def focal_loss(logits, targets, gamma=2.0, alpha=None, reduction='mean'):
         return focal
 
 
-# ====================== Model: Block X/Y + Offset X/Y + Clock ======================
+# ====================== Model ======================
 class SimpleGATModel(nn.Module):
     def __init__(self, gat_encoder, num_blocks=10, block_size=6, num_clock_classes=4):
         super().__init__()
@@ -52,7 +51,6 @@ class SimpleGATModel(nn.Module):
         self.block_y_head = make_head(self.num_block_classes)
         self.offset_x_head = make_head(self.num_offset_classes)
         self.offset_y_head = make_head(self.num_offset_classes)
-
         self.clock_head = nn.Sequential(
             nn.Linear(emb_dim, emb_dim),
             nn.ReLU(),
@@ -71,21 +69,100 @@ class SimpleGATModel(nn.Module):
         )
 
 
+# ====================== Dataset scanning & grid derivation ======================
+def scan_dataset_stats(root_dir):
+    """Scan dataset once to collect metadata for grid parameter derivation."""
+    root = Path(root_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset dir not found: {root}")
+
+    max_x, max_y, max_clock = -1, -1, -1
+    layout_w, layout_h = None, None
+    func_set = set()
+    total_steps = 0
+
+    success_dirs = list(root.rglob("*_success"))
+    if not success_dirs:
+        raise ValueError(f"No *_success directory under {root}")
+
+    for ep_dir in success_dirs:
+        raw_dir = ep_dir / "raw_graph_data"
+        if not raw_dir.exists():
+            continue
+        for pt_file in raw_dir.glob("step*_raw.pt"):
+            data = torch.load(pt_file, weights_only=False)
+            if 'target_x' not in data or 'target_y' not in data:
+                continue
+
+            max_x = max(max_x, int(data['target_x']))
+            max_y = max(max_y, int(data['target_y']))
+            max_clock = max(max_clock, int(data.get("clock_phase", 0)))
+
+            f = data.get("function", None)
+            if f is not None:
+                func_set.add(f)
+
+            if layout_w is None and "layout_width" in data and "layout_height" in data:
+                layout_w = int(data["layout_width"])
+                layout_h = int(data["layout_height"])
+
+            total_steps += 1
+
+    if total_steps == 0:
+        raise ValueError(f"No valid step*_raw.pt under {root}")
+
+    return {
+        "max_x": max_x, "max_y": max_y, "max_clock": max_clock,
+        "layout_w": layout_w, "layout_h": layout_h,
+        "func_set": func_set, "total_steps": total_steps,
+    }
+
+
+def derive_grid_params(stats, target_num_blocks=None, target_block_size=None):
+    """
+    Derive (num_blocks, block_size) from dataset statistics.
+
+    Priority:
+      1) target_block_size given -> fix block size, compute num_blocks
+      2) target_num_blocks given -> fix num blocks, compute block_size
+      3) both None -> default to 10 blocks
+    """
+    if stats.get("layout_w") is not None and stats.get("layout_h") is not None:
+        span = max(int(stats["layout_w"]), int(stats["layout_h"]))
+    else:
+        span = max(stats["max_x"] + 1, stats["max_y"] + 1)
+    span = max(span, 1)
+
+    if target_block_size is not None:
+        block_size = max(1, int(target_block_size))
+        num_blocks = (span + block_size - 1) // block_size
+    elif target_num_blocks is not None:
+        num_blocks = max(1, int(target_num_blocks))
+        block_size = (span + num_blocks - 1) // num_blocks
+    else:
+        num_blocks = 10
+        block_size = (span + num_blocks - 1) // num_blocks
+
+    return num_blocks, block_size
+
+
 # ====================== Dataset ======================
 class QCASingleStepDataset(Dataset):
-    def __init__(self, root_dir, num_blocks=10, block_size=6):
+    def __init__(self, root_dir, num_blocks, block_size):
         self.root_dir = Path(root_dir)
-        self.num_blocks = num_blocks
-        self.block_size = block_size
+        self.num_blocks = int(num_blocks)
+        self.block_size = int(block_size)
         self.samples = []
         self.function_to_idx = {}
         self._load_data()
 
     def _load_data(self):
-        func_set = set()
         success_dirs = list(self.root_dir.rglob("*_success"))
         if not success_dirs:
-            raise ValueError(f"No *_success directory found under {self.root_dir}")
+            raise ValueError(f"No *_success directory under {self.root_dir}")
+
+        func_set = set()
+        all_data = []
 
         for ep_dir in success_dirs:
             raw_dir = ep_dir / "raw_graph_data"
@@ -95,48 +172,36 @@ class QCASingleStepDataset(Dataset):
                 raw_dir.glob("step*_raw.pt"),
                 key=lambda x: int(re.search(r'step(\d+)_raw', x.stem).group(1)),
             )
-            if not step_files:
-                continue
-            data = torch.load(step_files[0], weights_only=False)
-            func = data.get("function", None)
-            if func is not None:
-                func_set.add(func)
-
-        self.function_to_idx = {func: idx for idx, func in enumerate(sorted(func_set))}
-
-        max_coord = self.num_blocks * self.block_size - 1
-        for ep_dir in success_dirs:
-            raw_dir = ep_dir / "raw_graph_data"
-            if not raw_dir.exists():
-                continue
-            step_files = sorted(
-                raw_dir.glob("step*_raw.pt"),
-                key=lambda x: int(re.search(r'step(\d+)_raw', x.stem).group(1)),
-            )
-            if not step_files:
-                continue
-
             for pt_file in step_files:
                 data = torch.load(pt_file, weights_only=False)
                 if 'target_x' not in data or 'target_y' not in data:
                     continue
-                x = min(max(int(data['target_x']), 0), max_coord)
-                y = min(max(int(data['target_y']), 0), max_coord)
+                all_data.append(data)
+                f = data.get("function", None)
+                if f is not None:
+                    func_set.add(f)
 
-                graph_dict = {
-                    "node_features": data["node_features"],
-                    "edge_index": data["edge_index"],
-                    "hyperedge_adj": data.get("hyperedge_adj"),
-                }
-                self.samples.append((
-                    graph_dict,
-                    x // self.block_size,
-                    y // self.block_size,
-                    x % self.block_size,
-                    y % self.block_size,
-                    int(data.get("clock_phase", 0)),
-                    data.get("function", "unknown"),
-                ))
+        self.function_to_idx = {func: idx for idx, func in enumerate(sorted(func_set))}
+
+        max_coord = self.num_blocks * self.block_size - 1
+        for data in all_data:
+            x = min(max(int(data['target_x']), 0), max_coord)
+            y = min(max(int(data['target_y']), 0), max_coord)
+
+            graph_dict = {
+                "node_features": data["node_features"],
+                "edge_index": data["edge_index"],
+                "hyperedge_adj": data.get("hyperedge_adj"),
+            }
+            self.samples.append((
+                graph_dict,
+                x // self.block_size,
+                y // self.block_size,
+                x % self.block_size,
+                y % self.block_size,
+                int(data.get("clock_phase", 0)),
+                data.get("function", "unknown"),
+            ))
 
     def __len__(self):
         return len(self.samples)
@@ -153,7 +218,8 @@ def collate_single_step(batch):
     offset_y_labels = torch.tensor([item[4] for item in batch], dtype=torch.long)
     clock_labels = torch.tensor([item[5] for item in batch], dtype=torch.long)
     func_names = [item[6] for item in batch]
-    return graph_dicts, block_x_labels, block_y_labels, offset_x_labels, offset_y_labels, clock_labels, func_names
+    return (graph_dicts, block_x_labels, block_y_labels,
+            offset_x_labels, offset_y_labels, clock_labels, func_names)
 
 
 # ====================== Data augmentation ======================
@@ -188,7 +254,7 @@ def augment_graph(graph_dict, drop_edge_prob=0.15, noise_std=0.01):
     return graph_dict
 
 
-# ====================== Loss composition ======================
+# ====================== Loss ======================
 def compute_loss(block_x_logits, block_y_logits,
                  offset_x_logits, offset_y_logits, clock_logits,
                  block_x_labels, block_y_labels,
@@ -221,7 +287,8 @@ def evaluate(model, dataloader, device,
     total_clock_acc = 0.0
     total_steps = 0
 
-    for graph_dicts, block_x_labels, block_y_labels, offset_x_labels, offset_y_labels, clock_labels, _ in dataloader:
+    for (graph_dicts, block_x_labels, block_y_labels,
+         offset_x_labels, offset_y_labels, clock_labels, _) in dataloader:
         embs = []
         for g in graph_dicts:
             g_data = {
@@ -244,7 +311,7 @@ def evaluate(model, dataloader, device,
         offset_y_labels = offset_y_labels.to(device)
         clock_labels = clock_labels.to(device)
 
-        loss, _, _, _, _, _ = compute_loss(
+        loss, *_ = compute_loss(
             block_x_logits, block_y_logits,
             offset_x_logits, offset_y_logits, clock_logits,
             block_x_labels, block_y_labels,
@@ -260,22 +327,21 @@ def evaluate(model, dataloader, device,
         total_clock_acc += (clock_logits.argmax(1) == clock_labels).sum().item()
         total_steps += block_x_labels.size(0)
 
-    avg_loss = total_loss / total_steps if total_steps > 0 else 0.0
-    block_x_acc = total_block_x_acc / total_steps if total_steps > 0 else 0.0
-    block_y_acc = total_block_y_acc / total_steps if total_steps > 0 else 0.0
-    offset_x_acc = total_offset_x_acc / total_steps if total_steps > 0 else 0.0
-    offset_y_acc = total_offset_y_acc / total_steps if total_steps > 0 else 0.0
-    clock_acc = total_clock_acc / total_steps if total_steps > 0 else 0.0
-
-    return avg_loss, block_x_acc, block_y_acc, offset_x_acc, offset_y_acc, clock_acc
+    denom = max(total_steps, 1)
+    return (
+        total_loss / denom,
+        total_block_x_acc / denom,
+        total_block_y_acc / denom,
+        total_offset_x_acc / denom,
+        total_offset_y_acc / denom,
+        total_clock_acc / denom,
+    )
 
 
 # ====================== Training ======================
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    NUM_BLOCKS = 10
-    BLOCK_SIZE = 6
     BATCH_SIZE = 64
     EPOCHS = 150
     LR = 5e-4
@@ -294,29 +360,46 @@ def main():
     LOG_SAVE_PATH = "model/training_logs_split_block_xy_offset_clock.pt"
     PATIENCE = 15
 
+    # Grid derivation: set at most one; target_block_size takes priority.
+    TARGET_NUM_BLOCKS = None
+    TARGET_BLOCK_SIZE = None
+
     Path(MODEL_SAVE_PATH).parent.mkdir(parents=True, exist_ok=True)
     Path(LOG_SAVE_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-    root_dir = Path(__file__).parent/ "data"
+    root_dir = Path(__file__).parent / "data"
 
-    temp_dataset = QCASingleStepDataset(root_dir, num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
-    node_feat_dim = temp_dataset[0][0]["node_features"].shape[1]
+    print("[Scan] scanning dataset ...")
+    stats = scan_dataset_stats(root_dir)
+    print(f"[Scan] max_x={stats['max_x']}, max_y={stats['max_y']}, "
+          f"max_clock={stats['max_clock']}, "
+          f"layout={stats['layout_w']}x{stats['layout_h']}, "
+          f"total_steps={stats['total_steps']}, "
+          f"functions={sorted(stats['func_set'])}")
 
-    max_block_x = max((s[1] for s in temp_dataset.samples), default=0)
-    max_block_y = max((s[2] for s in temp_dataset.samples), default=0)
-    max_offset_x = max((s[3] for s in temp_dataset.samples), default=0)
-    max_offset_y = max((s[4] for s in temp_dataset.samples), default=0)
-    max_clock = max((s[5] for s in temp_dataset.samples), default=0)
+    NUM_BLOCKS, BLOCK_SIZE = derive_grid_params(
+        stats,
+        target_num_blocks=TARGET_NUM_BLOCKS,
+        target_block_size=TARGET_BLOCK_SIZE,
+    )
+    NUM_CLOCK_CLASSES = max(4, stats["max_clock"] + 1)
+    print(f"[Derive] NUM_BLOCKS={NUM_BLOCKS}, BLOCK_SIZE={BLOCK_SIZE}, "
+          f"NUM_CLOCK_CLASSES={NUM_CLOCK_CLASSES}")
 
-    NUM_BLOCKS = max(NUM_BLOCKS, max_block_x + 1, max_block_y + 1)
-    BLOCK_SIZE = max(BLOCK_SIZE, max_offset_x + 1, max_offset_y + 1)
-    NUM_CLOCK_CLASSES = max(4, max_clock + 1)
+    coord_span = max(stats["max_x"] + 1, stats["max_y"] + 1)
+    if NUM_BLOCKS * BLOCK_SIZE < coord_span:
+        print(f"[WARN] grid covers {NUM_BLOCKS * BLOCK_SIZE} < span {coord_span}, "
+              f"some coords will be clamped")
 
     full_dataset = QCASingleStepDataset(root_dir, num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
+    node_feat_dim = full_dataset[0][0]["node_features"].shape[1]
+
     total_size = len(full_dataset)
     train_size = int(0.8 * total_size)
     val_size = total_size - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size]
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
                               collate_fn=collate_single_step, pin_memory=True)
@@ -341,7 +424,9 @@ def main():
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
 
     best_val_loss = float('inf')
     no_improve = 0
@@ -351,9 +436,15 @@ def main():
         'block_x_acc': [], 'block_y_acc': [],
         'offset_x_acc': [], 'offset_y_acc': [], 'clock_acc': [],
         'lr': [], 'grad_norm': [],
+        'num_blocks': NUM_BLOCKS,
+        'block_size': BLOCK_SIZE,
+        'num_clock_classes': NUM_CLOCK_CLASSES,
     }
 
-    print(f"Device: {device} | Node feat dim: {node_feat_dim} | Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+    print(f"Device: {device} | Node feat dim: {node_feat_dim} | "
+          f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+    print(f"Grid: NUM_BLOCKS={NUM_BLOCKS}, BLOCK_SIZE={BLOCK_SIZE}, "
+          f"NUM_CLOCK_CLASSES={NUM_CLOCK_CLASSES}")
 
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -361,7 +452,8 @@ def main():
         total_grad_norm = 0.0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
 
-        for graph_dicts, block_x_labels, block_y_labels, offset_x_labels, offset_y_labels, clock_labels, _ in progress:
+        for (graph_dicts, block_x_labels, block_y_labels,
+             offset_x_labels, offset_y_labels, clock_labels, _) in progress:
             block_x_labels = block_x_labels.to(device)
             block_y_labels = block_y_labels.to(device)
             offset_x_labels = offset_x_labels.to(device)
@@ -407,8 +499,8 @@ def main():
             total_grad_norm += grad_norm.item()
             progress.set_postfix(loss=f"{loss.item():.4f}")
 
-        avg_train_loss = total_loss / len(train_loader)
-        avg_grad_norm = total_grad_norm / len(train_loader) if len(train_loader) > 0 else 0.0
+        avg_train_loss = total_loss / max(len(train_loader), 1)
+        avg_grad_norm = total_grad_norm / max(len(train_loader), 1)
 
         val_loss, block_x_acc, block_y_acc, offset_x_acc, offset_y_acc, clock_acc = evaluate(
             model, val_loader, device,
